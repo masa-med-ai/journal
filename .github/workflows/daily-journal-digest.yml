@@ -1,0 +1,326 @@
+# .github/workflows/daily-journal-digest.yml
+#
+# ============================================================
+# Daily Journal Digest — powered by Claude Code
+# ============================================================
+# このワークフローは毎朝 PubMed から最新論文を3本選定し、
+# HTMLメールとして配信します。
+#
+# 【必要なSecretsの設定】（Settings → Secrets → Actions）
+#   CLAUDE_CODE_OAUTH_TOKEN  : Claude Code の OAuth トークン
+#   GMAIL_USER               : 送信元 Gmail アドレス
+#   GMAIL_APP_PASSWORD       : Gmail アプリパスワード
+#
+# 【カスタマイズ箇所】
+#   - cron スケジュール（デフォルト: 毎朝 7:00 JST）
+#   - prompt のジャーナルリスト・選定基準
+#   - digest/mailing_list.txt に配信先を記載
+# ============================================================
+
+name: Daily Journal Digest
+
+on:
+  schedule:
+    - cron: '0 22 * * *'  # 毎朝 7:00 JST (UTC 22:00)
+  workflow_dispatch:        # 手動実行も可能
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      # -------------------------------------------------------
+      # 1. チェックアウト
+      # -------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
+      # -------------------------------------------------------
+      # 2. 日付取得（JST）
+      # -------------------------------------------------------
+      - name: Get today's date (JST)
+        id: date
+        run: |
+          echo "today=$(TZ='Asia/Tokyo' date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          echo "today_slash=$(TZ='Asia/Tokyo' date +'%Y/%m/%d')" >> $GITHUB_OUTPUT
+
+      # -------------------------------------------------------
+      # 3. CSV データベース初期化（初回実行時に自動作成）
+      # -------------------------------------------------------
+      - name: Ensure CSV database exists
+        run: |
+          mkdir -p digest
+          if [ ! -f digest/journal_digest_database.csv ]; then
+            echo 'date_introduced,journal,title,authors,year,pmid,doi,summary_ja' \
+              > digest/journal_digest_database.csv
+          fi
+
+      # -------------------------------------------------------
+      # 4. Claude Code — PubMed 検索 → papers.json + CSV 更新
+      # -------------------------------------------------------
+      - name: Run Claude Code — search & summarize
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            あなたは消化器内視鏡・消化器病学の臨床経験豊富な専門医です。
+            以下のタスクを実行し、最終的に papers.json と CSV更新 の2つを出力してください。
+            HTMLの生成は不要です（別のステップで行います）。
+
+            # 今日の日付
+            ${{ steps.date.outputs.today }}
+
+            # ========================================
+            # Step 1: 既存データベース読み込み（重複防止）
+            # ========================================
+            digest/journal_digest_database.csv を Read で読み込み、
+            紹介済みのPMIDリストを取得。
+
+            ★ CSVのpmid列の値をすべてリストアップし、このリストを used_pmids として保持すること。
+            ★ CSVが空（ヘッダーのみ）の場合は used_pmids = 空リスト とする。
+            ★ Step 3 の選定時に、used_pmids に含まれる PMID の論文は絶対に選ばないこと。
+
+            # ========================================
+            # Step 2: PubMed 検索
+            # ========================================
+            以下の10誌から最新論文を mcp__pubmed__search_pubmed で検索。
+            各ジャーナル最新 30 件、合計300件程度。date_range は直近3ヶ月。sort: pub_date。
+
+            - "Endoscopy"[Journal]
+            - "Gastrointest Endosc"[Journal]
+            - "Dig Endosc"[Journal]
+            - "Surg Endosc"[Journal]
+            - "Gastroenterology"[Journal]
+            - "Gut"[Journal]
+            - "Lancet Gastroenterol Hepatol"[Journal]
+            - "Aliment Pharmacol Ther"[Journal]
+            - "Clin Gastroenterol Hepatol"[Journal]
+            - "Am J Gastroenterol"[Journal]
+
+            # ========================================
+            # Step 3: 論文選定（3本）
+            # ========================================
+            選定基準:
+            1. ★最優先★ used_pmids と照合 → 紹介済みPMIDは絶対に除外
+               （選定した3本のPMIDがすべて used_pmids に含まれていないことを確認）
+            2. 異なるジャーナルから選ぶ（同一誌2本以上は避ける）
+            3. 臨床インパクト重視: RCT > メタアナリシス > 大規模コホート > ガイドライン
+            4. 注目トピック優先: AI内視鏡、新規治療法、スクリーニング戦略、IBD新規治療
+            5. Original Article 優先（Letter, Commentary, Errataは除外）
+
+            ★ 選定後の検証: 選んだ3本のPMIDを1つずつ used_pmids と照合し、
+              重複があれば別の論文に差し替えること。この検証をスキップしないこと。
+
+            # ========================================
+            # Step 4: 抄録取得と臨床解説の作成
+            # ========================================
+            選定した3本の抄録を mcp__pubmed__get_full_abstract で取得。
+
+            ★★★ 最重要指示 ★★★
+            「抄録の日本語翻訳」ではなく、臨床家が朝の5分で
+            「この論文は自分の診療に関係あるか」を判断できる解説を書くこと。
+
+            各論文について以下の項目を作成:
+
+            【background】なぜこの研究が必要だったか（2-3文）
+            - 従来のエビデンスの限界や臨床課題を明記
+
+            【methods】方法の要点（2-3文）
+            - N数、研究デザイン、Primary endpoint のみ抽出（抄録の翻訳は禁止）
+
+            【results】臨床的に重要な数値（3-5文）
+            - HR, OR, AUC, P値, 95%CI を必ず含める
+            - clinical significance にも触れる
+
+            【limitations】研究の限界（1-2文）
+            - 抄録に明記なくてもデザインから推定（例: 単施設、短い追跡、アジアデータなし等）
+
+            【so_what】だから臨床にどう影響するか（3-4文）★最重要
+            - 明日からの診療をどう変えうるか
+            - 既存ガイドライン・先行研究との文脈での位置づけ
+            - 日本の臨床現場への示唆
+            ※「重要な知見である」「今後の研究が期待される」等の定型句は禁止
+
+            # ========================================
+            # Step 5: papers.json を出力
+            # ========================================
+            以下の形式で papers.json をリポジトリルートに Write で書き出してください。
+
+            ```json
+            {
+              "date_slash": "${{ steps.date.outputs.today_slash }}",
+              "papers": [
+                {
+                  "title": "English original title",
+                  "pmid": "12345678",
+                  "authors": "First Author et al.",
+                  "journal": "Journal Name",
+                  "year": "2026",
+                  "design": "研究デザイン",
+                  "background": "Background テキスト（日本語）",
+                  "methods": "Methods テキスト（日本語）",
+                  "results": "Results テキスト（日本語）",
+                  "limitations": "Limitations テキスト（日本語）",
+                  "so_what": "So What テキスト（日本語）",
+                  "doi": "10.xxxx/yyyy"
+                }
+              ],
+              "overall_comment": "3本を横断した総括（日本語）"
+            }
+            ```
+
+            JSONの注意事項:
+            - 文字列中にダブルクォートがある場合はバックスラッシュでエスケープ
+            - 改行は含めず、一つのテキストブロックとして記述
+            - papers配列は必ず3要素
+
+            【総括コメント（overall_comment）】
+            - 3本に共通するトレンドがあれば指摘
+            - 日本の臨床現場への示唆を必ず含める
+            ※「いずれも重要な研究である」のような空虚な総括は禁止
+
+            # ========================================
+            # Step 6: CSV データベース更新
+            # ========================================
+            Bash(python3:*) を使って CSV に追記:
+
+            ```python
+            import csv
+            rows = [
+                ["${{ steps.date.outputs.today }}", "Journal", "Title", "Author et al.", "Year", "PMID", "DOI", "So What要約"],
+                # ... 実データで3行分
+            ]
+            with open("digest/journal_digest_database.csv", "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f, quoting=csv.QUOTE_ALL)
+                writer.writerows(rows)
+            ```
+
+            # ========================================
+            # 品質チェック（出力前に確認）
+            # ========================================
+            □ papers.json が valid JSON か（python3 -c "import json; json.load(open('papers.json'))" で確認）
+            □ papers 配列が 3 要素あるか
+            □ 各 so_what に具体的な臨床シナリオ or 先行研究との比較が含まれるか
+            □ 定型句を使っていないか
+            □ Key Findings に P値/CI/AUC等の数値があるか
+            □ CSVが正常に追記されたか
+
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 25
+            --allowedTools Read,Write,Glob,Grep,Bash(cat:*),Bash(ls:*),Bash(wc:*),Bash(tail:*),Bash(head:*),Bash(python3:*),mcp__pubmed__search_pubmed,mcp__pubmed__get_full_abstract,mcp__pubmed__count_results
+            --mcp-config '{"mcpServers":{"pubmed":{"command":"npx","args":["-y","pubmed_mcp_server2"]}}}'
+
+      # -------------------------------------------------------
+      # 5. papers.json → email_body.html（Python スクリプトで変換）
+      # -------------------------------------------------------
+      - name: Render HTML email from papers.json
+        run: |
+          if [ ! -f papers.json ]; then
+            echo "::error::papers.json not found — Claude Code may have failed"
+            exit 1
+          fi
+          python3 -c "import json; json.load(open('papers.json'))" || {
+            echo "::error::papers.json is not valid JSON"
+            exit 1
+          }
+          python3 digest/render_email.py papers.json
+          echo "HTML email rendered successfully"
+
+      # -------------------------------------------------------
+      # 6. メール本文読み込み
+      # -------------------------------------------------------
+      - name: Read email body
+        id: email
+        run: |
+          if [ -f email_body.html ]; then
+            delimiter="$(openssl rand -hex 16)"
+            {
+              echo "body<<${delimiter}"
+              cat email_body.html
+              echo ""
+              echo "${delimiter}"
+            } >> $GITHUB_OUTPUT
+          else
+            echo "body=<p>Error: email_body.html not generated.</p>" >> $GITHUB_OUTPUT
+            echo "::warning::email_body.html not found"
+          fi
+
+      # -------------------------------------------------------
+      # 7. メーリングリスト読み込み
+      # -------------------------------------------------------
+      - name: Load mailing list
+        id: recipients
+        run: |
+          MAIL_LIST="digest/mailing_list.txt"
+          if [ ! -f "$MAIL_LIST" ]; then
+            echo "::error::$MAIL_LIST not found"
+            exit 1
+          fi
+          # コメント行(#)と空行を除外し、カンマ区切りに変換
+          ADDRESSES=$(grep -v '^\s*#' "$MAIL_LIST" | grep -v '^\s*$' | tr '\n' ',' | sed 's/,$//')
+          if [ -z "$ADDRESSES" ]; then
+            echo "::error::No valid email addresses in $MAIL_LIST"
+            exit 1
+          fi
+          echo "to=$ADDRESSES" >> $GITHUB_OUTPUT
+          echo "Sending to: $ADDRESSES"
+
+      # -------------------------------------------------------
+      # 8. Gmail 送信
+      # -------------------------------------------------------
+      - name: Send Email via Gmail
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          subject: "📚 Journal Digest — ${{ steps.date.outputs.today_slash }}"
+          to: ${{ steps.recipients.outputs.to }}
+          from: ${{ secrets.GMAIL_USER }}
+          html_body: ${{ steps.email.outputs.body }}
+          convert_markdown: false
+
+      # -------------------------------------------------------
+      # 9. CSV 更新をコミット
+      # -------------------------------------------------------
+      - name: Commit updated CSV
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+
+          git add digest/journal_digest_database.csv
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "📚 Update journal digest database — ${{ steps.date.outputs.today }}"
+
+          # リベース＋プッシュ（最大3回リトライ）
+          for i in 1 2 3; do
+            if git pull --rebase origin "${{ github.ref_name }}" && git push; then
+              echo "Push succeeded"
+              exit 0
+            fi
+            echo "Retry ($i/3)..."
+            git rebase --abort 2>/dev/null || true
+            sleep 5
+          done
+
+          echo "::error::Failed to push after 3 retries"
+          exit 1
