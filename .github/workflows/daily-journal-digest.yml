@@ -91,7 +91,7 @@ jobs:
             # ========================================
             # Step 2: PubMed 検索
             # ========================================
-            以下の10誌から最新論文を mcp__pubmed__search_pubmed で検索。
+            以下の10誌から最新論文を mcp__pubmed__search で検索。
             各ジャーナル最新 30 件、合計300件程度。date_range は直近3ヶ月。sort: pub_date。
 
             - "Endoscopy"[Journal]
@@ -122,7 +122,7 @@ jobs:
             # ========================================
             # Step 4: 抄録取得と臨床解説の作成
             # ========================================
-            選定した3本の抄録を mcp__pubmed__get_full_abstract で取得。
+            選定した3本の抄録を mcp__pubmed__fetch_batch で取得。
 
             ★★★ 最重要指示 ★★★
             「抄録の日本語翻訳」ではなく、臨床家が朝の5分で
@@ -216,9 +216,9 @@ jobs:
           claude_args: |
             --model claude-sonnet-4-6
             --max-turns 25
-            --allowedTools Read,Write,Glob,Grep,Bash(cat:*),Bash(ls:*),Bash(wc:*),Bash(tail:*),Bash(head:*),Bash(python3:*),mcp__pubmed__search_pubmed,mcp__pubmed__get_full_abstract,mcp__pubmed__count_results
+            --allowedTools Read,Write,Glob,Grep,Bash(cat:*),Bash(ls:*),Bash(wc:*),Bash(tail:*),Bash(head:*),Bash(python3:*),mcp__pubmed__search,mcp__pubmed__fetch,mcp__pubmed__fetch_batch,mcp__pubmed__count
             --mcp-config '{"mcpServers":{"pubmed":{"command":"npx","args":["-y","pubmed_mcp_server2"]}}}'
-
+            
       # -------------------------------------------------------
       # 5. papers.json → email_body.html（Python スクリプトで変換）
       # -------------------------------------------------------
@@ -313,7 +313,7 @@ jobs:
 
           # リベース＋プッシュ（最大3回リトライ）
           for i in 1 2 3; do
-            if git pull --rebase origin "${{ github.ref_name }}" && git push; then
+            if git pull --rebase --autostash origin "${{ github.ref_name }}" && git push; then
               echo "Push succeeded"
               exit 0
             fi
